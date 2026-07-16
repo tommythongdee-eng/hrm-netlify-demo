@@ -4,12 +4,29 @@
 
 [functions]
   directory = "netlify/functions"
-  # The function does dynamic `require("./dist/bootstrap")` (not a static
-  # top-level import) and ships a binary seed-template.db + Prisma's native
-  # engine — esbuild's automatic dependency scanner may not reliably pick
-  # all of that up, so ship the function's own directory (dist/, prisma/,
-  # node_modules/) as-is instead of relying on bundling/tree-shaking.
-  node_bundler = "none"
+
+[functions.api]
+  # node_bundler = "none" turned out NOT to auto-include node_modules in the
+  # deployed bundle (confirmed live: "Cannot find module 'serverless-http'")
+  # — Netlify just ships the function file(s) with no dependencies at all in
+  # that mode. Use esbuild instead, but mark every runtime dependency
+  # (including Prisma's generated client/engine, which esbuild's static
+  # analysis can't safely inline) as external so esbuild copies the real
+  # package folders into the bundle instead of trying to tree-shake them.
+  # included_files covers the two things esbuild's import/require scanner
+  # can't see at all: the pre-compiled dist/ (loaded via a dynamic
+  # require(), not a static import) and the binary seed-template.db (loaded
+  # via fs.copyFileSync, not require()).
+  node_bundler = "esbuild"
+  external_node_modules = [
+    "@nestjs/common", "@nestjs/config", "@nestjs/core", "@nestjs/jwt", "@nestjs/platform-express",
+    "@prisma/client", ".prisma/client", "bcrypt", "class-transformer", "class-validator", "express",
+    "nodemailer", "pdfkit", "reflect-metadata", "rxjs", "serverless-http"
+  ]
+  included_files = [
+    "netlify/functions/api/dist/**",
+    "netlify/functions/api/prisma/seed-template.db"
+  ]
 
 [[plugins]]
   package = "@netlify/plugin-nextjs"
