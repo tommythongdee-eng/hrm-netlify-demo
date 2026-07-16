@@ -1,0 +1,647 @@
+generator client {
+  provider      = "prisma-client-js"
+  // Netlify Functions run on Amazon Linux (Lambda). "native" also stays so
+  // local builds on this dev machine keep working.
+  binaryTargets = ["native", "rhel-openssl-3.0.x", "rhel-openssl-1.0.x"]
+}
+
+datasource db {
+  // SQLite for zero-install local dev (just a file, no server to run).
+  // Switch to "postgresql" for production — see README.
+  // NOTE: SQLite has no native enum type, so every enum-like column below is
+  // a plain String validated in application code via @hrm/shared's const-object
+  // types (mirroring MembershipRole). Postgres would let Prisma use real enums.
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// A tenant. Every HR module scopes its data to an organizationId.
+model Organization {
+  id   String @id @default(uuid())
+  name String
+  slug String @unique
+
+  // Optional standard work hours ("HH:mm"), used only for a simple
+  // late-arrival flag in the attendance UI — not a full shift-scheduling system.
+  standardStartTime String?
+  standardEndTime   String?
+
+  // Platform-level state, managed by the superadmin console — not visible to
+  // or editable by tenant members. A SUSPENDED org's regular logins are blocked.
+  status String @default("ACTIVE") // @hrm/shared OrganizationStatus
+
+  // No payment gateway in this phase — plan assignment is superadmin-only and
+  // subscriptionStatus is set manually, not driven by any billing webhook.
+  plan               Plan?   @relation(fields: [planId], references: [id])
+  planId             String?
+  subscriptionStatus String  @default("ACTIVE") // @hrm/shared SubscriptionStatus
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships       Membership[]
+  departments       Department[]
+  employees         Employee[]
+  leaveTypes        LeaveType[]
+  publicHolidays    PublicHoliday[]
+  taxBrackets       TaxBracket[]
+  payrollSettings   PayrollSettings?
+  payrollRuns       PayrollRun[]
+  reviewCycles      ReviewCycle[]
+  surveys           Survey[]
+  talentAssessments TalentAssessment[]
+  keyPositions      KeyPosition[]
+
+  @@map("organizations")
+}
+
+// A platform-level product tier — not tenant data. Only the superadmin console
+// manages these; an Organization merely references one via planId.
+model Plan {
+  id                String  @id @default(uuid())
+  code              String  @unique
+  name              String
+  maxEmployees      Int
+  priceThbPerMonth  Float
+  isActive          Boolean @default(true)
+
+  organizations Organization[]
+
+  @@map("plans")
+}
+
+// A login identity. Kept separate from Membership/Employee so the same person
+// could join multiple organizations in a later phase without changing this model.
+model User {
+  id            String         @id @default(uuid())
+  email         String         @unique
+  passwordHash  String
+  name          String
+  // A platform operator, not a tenant member — outside the Membership/RBAC
+  // model entirely. Authenticates via a separate /auth/superadmin-login path.
+  isSuperAdmin  Boolean        @default(false)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  memberships   Membership[]
+  refreshTokens RefreshToken[]
+
+  // Set when this login is linked to an HR employee record (self-service).
+  employee                Employee?
+  uploadedDocuments        EmployeeDocument[]
+  respondedLeaveRequests   LeaveRequest[]
+  loggedTrainingRecords    TrainingRecord[]
+  assessedTalentAssessments TalentAssessment[]
+
+  @@map("users")
+}
+
+// The user <-> organization link that carries the RBAC role.
+model Membership {
+  id             String       @id @default(uuid())
+  role           String // one of @hrm/shared's MembershipRole values
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId         String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  organizationId String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+  @@map("memberships")
+}
+
+// Refresh tokens are stored hashed so a leaked DB dump can't be replayed
+// directly, and so a single token can be revoked without invalidating others.
+model RefreshToken {
+  id        String    @id @default(uuid())
+  tokenHash String    @unique
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model Department {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  name String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  employees Employee[]
+
+  @@unique([organizationId, name])
+  @@map("departments")
+}
+
+// The HR record for a person. Separate from User: HR can create an Employee
+// without granting portal access, and later link one (userId) to enable
+// self-service (clock in/out, leave requests, payslips).
+model Employee {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  user   User?   @relation(fields: [userId], references: [id])
+  userId String? @unique
+
+  employeeCode String
+
+  firstName   String
+  lastName    String
+  firstNameTh String?
+  lastNameTh  String?
+
+  nationalId  String?
+  dateOfBirth DateTime?
+  gender      String?
+  email       String?
+  phone       String?
+  address     String?
+
+  department   Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  departmentId String?
+
+  position       String
+  employmentType String // @hrm/shared EmploymentType
+
+  // Direct manager, used to route leave-request approvals.
+  manager   Employee?  @relation("EmployeeManager", fields: [managerId], references: [id], onDelete: SetNull)
+  managerId String?
+  reports   Employee[] @relation("EmployeeManager")
+
+  baseSalary        Float
+  bankName          String?
+  bankAccountNumber String?
+
+  // Opt-in only, and only meaningful once the org's PayrollSettings enables
+  // it. A null rate falls back to the org's default rate at calculation time.
+  providentFundOptIn       Boolean @default(false)
+  providentFundEmployeeRate Float?
+
+  startDate DateTime
+  endDate   DateTime?
+  status    String // @hrm/shared EmployeeStatus
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  documents            EmployeeDocument[]
+  attendanceRecords    AttendanceRecord[]
+  leaveBalances        LeaveBalance[]
+  leaveRequests        LeaveRequest[]
+  payslips             Payslip[]
+  performanceReviews   PerformanceReview[]
+  trainingRecords      TrainingRecord[]
+  talentAssessment     TalentAssessment?
+  successorCandidacies SuccessorCandidate[]
+  positionsHeld        KeyPosition[]
+  severanceRecord      SeveranceRecord?
+
+  @@unique([organizationId, employeeCode])
+  @@index([organizationId])
+  @@map("employees")
+}
+
+model EmployeeDocument {
+  id         String   @id @default(uuid())
+  employee   Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  employeeId String
+  // Denormalized for cheap tenant-scoped queries; the source of truth for
+  // ownership is still the employee relation above.
+  organizationId String
+
+  fileName   String
+  mimeType   String
+  sizeBytes  Int
+  storageKey String
+  category   String // @hrm/shared DocumentCategory
+
+  uploadedBy       User   @relation(fields: [uploadedByUserId], references: [id])
+  uploadedByUserId String
+
+  createdAt DateTime @default(now())
+
+  @@index([organizationId])
+  @@index([employeeId])
+  @@map("employee_documents")
+}
+
+model AttendanceRecord {
+  id             String   @id @default(uuid())
+  employee       Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  employeeId     String
+  organizationId String
+
+  date     DateTime
+  clockIn  DateTime?
+  clockOut DateTime?
+  source   String // @hrm/shared AttendanceSource
+  note     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([employeeId, date])
+  @@index([organizationId])
+  @@map("attendance_records")
+}
+
+model LeaveType {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  name               String
+  code               String
+  defaultDaysPerYear Float
+  requiresApproval   Boolean @default(true)
+  isPaid             Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  balances LeaveBalance[]
+  requests LeaveRequest[]
+
+  @@unique([organizationId, code])
+  @@map("leave_types")
+}
+
+model LeaveBalance {
+  id             String    @id @default(uuid())
+  employee       Employee  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  employeeId     String
+  leaveType      LeaveType @relation(fields: [leaveTypeId], references: [id], onDelete: Cascade)
+  leaveTypeId    String
+  organizationId String
+
+  year          Int
+  allocatedDays Float
+  usedDays      Float @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([employeeId, leaveTypeId, year])
+  @@index([organizationId])
+  @@map("leave_balances")
+}
+
+model LeaveRequest {
+  id             String    @id @default(uuid())
+  employee       Employee  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  employeeId     String
+  leaveType      LeaveType @relation(fields: [leaveTypeId], references: [id])
+  leaveTypeId    String
+  organizationId String
+
+  startDate DateTime
+  endDate   DateTime
+  daysCount Float
+  reason    String?
+  status    String // @hrm/shared LeaveRequestStatus
+
+  respondedBy       User?     @relation(fields: [respondedByUserId], references: [id])
+  respondedByUserId String?
+  respondedAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organizationId])
+  @@index([employeeId])
+  @@map("leave_requests")
+}
+
+// Approximate current-year Thai public holidays, seeded per org and editable —
+// some are lunar-calendar-based and shift year to year, so HR should verify.
+model PublicHoliday {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  date DateTime
+  name String
+
+  @@unique([organizationId, date])
+  @@map("public_holidays")
+}
+
+// One row per organization. Defaults reflect commonly-cited Thai SSF figures
+// at the time this was written — verify against current SSO rates before
+// running real payroll.
+model PayrollSettings {
+  id             String       @id @default(uuid())
+  organizationId String       @unique
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  socialSecurityEmployeeRate Float @default(0.05)
+  socialSecurityEmployerRate Float @default(0.05)
+  socialSecurityWageFloor    Float @default(1650)
+  socialSecurityWageCeiling  Float @default(15000)
+
+  // Provident fund is opt-in per employee (Employee.providentFundOptIn) —
+  // this is just the org-level switch + the default rate used when an
+  // employee opts in without a rate override.
+  providentFundEnabled             Boolean @default(false)
+  providentFundDefaultEmployeeRate Float   @default(0.03)
+  providentFundDefaultEmployerRate Float   @default(0.03)
+
+  updatedAt DateTime @updatedAt
+
+  @@map("payroll_settings")
+}
+
+// Progressive personal income tax brackets, seeded per org from the Thai PIT
+// table and editable — verify current brackets before running real payroll.
+model TaxBracket {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  minIncome Float
+  maxIncome Float?
+  rate      Float
+  order     Int
+
+  @@index([organizationId])
+  @@map("tax_brackets")
+}
+
+model PayrollRun {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  periodYear  Int
+  periodMonth Int
+  status      String // @hrm/shared PayrollRunStatus
+
+  createdAt   DateTime  @default(now())
+  finalizedAt DateTime?
+
+  payslips Payslip[]
+
+  @@unique([organizationId, periodYear, periodMonth])
+  @@map("payroll_runs")
+}
+
+model Payslip {
+  id             String     @id @default(uuid())
+  payrollRun     PayrollRun @relation(fields: [payrollRunId], references: [id], onDelete: Cascade)
+  payrollRunId   String
+  employee       Employee   @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  employeeId     String
+  organizationId String
+
+  baseSalary             Float
+  unpaidLeaveDeduction   Float @default(0)
+  grossPay               Float
+  socialSecurityEmployee Float
+  socialSecurityEmployer Float
+  withholdingTax         Float
+  providentFundEmployee  Float @default(0)
+  providentFundEmployer  Float @default(0)
+  netPay                 Float
+
+  createdAt DateTime @default(now())
+
+  @@unique([payrollRunId, employeeId])
+  @@index([organizationId])
+  @@map("payslips")
+}
+
+// An org-wide review period (e.g. "H1 2026 Review"). Activating it creates a
+// PerformanceReview row per active employee.
+model ReviewCycle {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  name      String
+  startDate DateTime
+  endDate   DateTime
+  status    String // @hrm/shared ReviewCycleStatus
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  reviews PerformanceReview[]
+
+  @@map("review_cycles")
+}
+
+// One per employee per cycle. No separate goals/OKR tracking in Phase 2 —
+// deliberately deferred; this is rating + comments only.
+model PerformanceReview {
+  id             String      @id @default(uuid())
+  cycle          ReviewCycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  cycleId        String
+  employee       Employee    @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  employeeId     String
+  organizationId String
+
+  selfRating        Int?
+  selfComments      String?
+  selfSubmittedAt   DateTime?
+
+  managerRating     Int?
+  managerComments   String?
+  managerSubmittedAt DateTime?
+
+  status String // @hrm/shared ReviewStatus
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([cycleId, employeeId])
+  @@index([organizationId])
+  @@map("performance_reviews")
+}
+
+model TrainingRecord {
+  id             String   @id @default(uuid())
+  employee       Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  employeeId     String
+  organizationId String
+
+  title          String
+  provider       String?
+  category       String // @hrm/shared TrainingCategory
+  completionDate DateTime
+  expiryDate     DateTime?
+  hours          Float?
+  notes          String?
+
+  createdBy       User   @relation(fields: [createdByUserId], references: [id])
+  createdByUserId String
+
+  createdAt DateTime @default(now())
+
+  @@index([organizationId])
+  @@index([employeeId])
+  @@map("training_records")
+}
+
+model Survey {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String?
+  status      String // @hrm/shared SurveyStatus
+
+  createdAt DateTime  @default(now())
+  closedAt  DateTime?
+
+  questions      SurveyQuestion[]
+  responses      SurveyResponse[]
+  participations SurveyParticipation[]
+
+  @@map("surveys")
+}
+
+model SurveyQuestion {
+  id       String @id @default(uuid())
+  survey   Survey @relation(fields: [surveyId], references: [id], onDelete: Cascade)
+  surveyId String
+
+  text  String
+  type  String // @hrm/shared SurveyQuestionType
+  order Int
+
+  answers SurveyAnswer[]
+
+  @@map("survey_questions")
+}
+
+// Deliberately carries no employeeId — see SurveyParticipation for the
+// separate, non-correlatable completion marker.
+model SurveyResponse {
+  id       String @id @default(uuid())
+  survey   Survey @relation(fields: [surveyId], references: [id], onDelete: Cascade)
+  surveyId String
+
+  submittedAt DateTime @default(now())
+
+  answers SurveyAnswer[]
+
+  @@map("survey_responses")
+}
+
+model SurveyAnswer {
+  id         String         @id @default(uuid())
+  response   SurveyResponse @relation(fields: [responseId], references: [id], onDelete: Cascade)
+  responseId String
+  question   SurveyQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  questionId String
+
+  numericValue Int?
+  textValue    String?
+
+  @@map("survey_answers")
+}
+
+// Tracks who has responded (for completion rate + dedup) without linking to
+// their SurveyResponse/SurveyAnswer rows — identity never correlates with
+// answer content.
+model SurveyParticipation {
+  id         String   @id @default(uuid())
+  survey     Survey   @relation(fields: [surveyId], references: [id], onDelete: Cascade)
+  surveyId   String
+  employeeId String
+  respondedAt DateTime @default(now())
+
+  @@unique([surveyId, employeeId])
+  @@map("survey_participations")
+}
+
+// The current 9-box (performance x potential) placement for an employee.
+// One row per employee — reassessing overwrites rather than keeping history.
+model TalentAssessment {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee       Employee     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  employeeId     String       @unique
+
+  performanceRating String // @hrm/shared RatingLevel
+  potentialRating   String // @hrm/shared RatingLevel
+  notes             String?
+
+  assessedBy   User     @relation(fields: [assessedByUserId], references: [id])
+  assessedByUserId String
+  assessedAt   DateTime @default(now())
+
+  @@map("talent_assessments")
+}
+
+model KeyPosition {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  title       String
+  criticality String? // @hrm/shared PositionCriticality
+  notes       String?
+
+  currentHolder   Employee? @relation(fields: [currentHolderId], references: [id], onDelete: SetNull)
+  currentHolderId String?
+
+  candidates SuccessorCandidate[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("key_positions")
+}
+
+model SuccessorCandidate {
+  id             String      @id @default(uuid())
+  keyPosition    KeyPosition @relation(fields: [keyPositionId], references: [id], onDelete: Cascade)
+  keyPositionId  String
+  employee       Employee    @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  employeeId     String
+  organizationId String
+
+  readiness String // @hrm/shared ReadinessLevel
+  notes     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([keyPositionId, employeeId])
+  @@map("successor_candidates")
+}
+
+// Statutory severance pay, calculated once when an employee transitions to
+// TERMINATED (see apps/api/src/employees/severance.util.ts) — not for
+// RESIGNED. Upserted, so re-terminating (edge case) recalculates in place.
+// This covers only the standard tenure-based formula; cause-based exemptions
+// still need manual HR judgment.
+model SeveranceRecord {
+  id             String   @id @default(uuid())
+  organizationId String
+  employee       Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  employeeId     String   @unique
+
+  yearsOfService Float
+  daysOfPay      Int
+  dailyRate      Float
+  amount         Float
+
+  calculatedAt DateTime @default(now())
+
+  @@index([organizationId])
+  @@map("severance_records")
+}

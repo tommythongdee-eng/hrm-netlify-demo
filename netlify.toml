@@ -1,0 +1,20 @@
+[build]
+  command = "npm install && npm run build && cd netlify/functions/api && npm install && npm run build"
+  publish = ".next"
+
+[functions]
+  directory = "netlify/functions"
+  # The function does dynamic `require("./dist/bootstrap")` (not a static
+  # top-level import) and ships a binary seed-template.db + Prisma's native
+  # engine — esbuild's automatic dependency scanner may not reliably pick
+  # all of that up, so ship the function's own directory (dist/, prisma/,
+  # node_modules/) as-is instead of relying on bundling/tree-shaking.
+  node_bundler = "none"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
